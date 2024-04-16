@@ -134,6 +134,8 @@ def main(args):
     features = np.concatenate(features).reshape(-1, 1)
     labels = np.concatenate(labels)
 
+    logging.info('Features and labels extracted....')
+
     # Create a DataFrame from features and labels
     df = pd.DataFrame(features, columns=['feature'])
     df['label'] = labels
@@ -159,6 +161,8 @@ def main(args):
     features = df_upsampled['feature'].values.reshape(-1, 1)
     labels = df_upsampled['label'].values
 
+    logging.info('Data resampled....')
+
     # 2. Supervised Classifier
     classifier = MLPClassifier(hidden_layer_sizes=(100, 100, 100),  # three layers of 100 nodes each
                            activation='tanh',  # tanh activation function
@@ -168,6 +172,8 @@ def main(args):
                            max_iter=1000,  # maximum number of iterations
                            random_state=42)  # for reproducibility
     classifier.fit(features, labels)
+
+    logging.info('Classifier trained....')
 
     # 3. Make predictions
     valset = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
