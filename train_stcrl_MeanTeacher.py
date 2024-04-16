@@ -1,0 +1,381 @@
+#########################
+# Spatiotemporal Contrastive Learning for RSE 2021
+# Pretext
+# Both pre- and post-disaster bldg objects, two sides
+#########################
+
+from torchvision import transforms, utils
+import torch
+import torch.nn.functional as F
+import time
+import logging
+import dataproc_double as dp
+import pandas as pd
+from utils import AverageMeter, show_tensor_img, set_logger, vis_ms, save_checkpoint, NT_Xent_Loss_v4, barlow_twins_loss
+from torch.utils.tensorboard import SummaryWriter
+import os
+from stcrl_net import STCRL_Net as Model
+import argparse
+from sklearn.utils import resample
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+import numpy as np
+from torch.utils.data import random_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import copy
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--experiment', type=str, default='Tmp_tag')
+parser.add_argument('--version', type=str, default='06162022_2212_tmp')
+parser.add_argument('-t', '--train_batch_size', type=int, default=256)
+parser.add_argument('-e', '--n_epochs', type=int, default=1)
+parser.add_argument('--lr', type=float, default=1e-2, help="learning rate")
+parser.add_argument('--wd', type=float, default=1e-4, help="weight decay")
+parser.add_argument('--pretrained_model', type=str, default=None, help="path to pre-trained model")
+parser.add_argument('--backbone', type=str, default='resnet18', help="backbone of the image encoder")
+# parser.add_argument('--data_path', type=str, default= "/home/bpeng/data/xBD/xbd_disasters_building_polygons_neighbors")
+parser.add_argument('--data_path', type=str, default= "/home/bpeng/mnt/mnt242/scdm_data/xBD/xbd_disasters_building_polygons_neighbors")
+parser.add_argument('--csv_train', type=str, default='csvs_buffer/train_tier3_test_hold_wo_unclassified.csv', help='train csv sub-path within data path')
+parser.add_argument('--csv_valid', type=str, default='csvs_buffer/sub_valid_wo_unclassified_prepost.csv', help='valid csv sub-path within data path')
+parser.add_argument('--print_freq', type=int, default=10, help="print evaluation for every n iterations")
+parser.add_argument('--gpu', action='store_true', default=False, help='use gpu for computing')
+
+
+def main(args):
+
+    #######################################################
+    # Create necessary folders for logging results
+    #######################################################
+    # create logs folder
+    experiments_dir = '../experiments'
+    experiment_dir = os.path.join(experiments_dir, args.experiment)
+    if not os.path.isdir(experiment_dir):
+        os.mkdir(experiment_dir)
+    version_dir = os.path.join(experiment_dir, args.version)
+    if not os.path.isdir(version_dir):
+        os.mkdir(version_dir)
+    for folder in ['logs', 'outputs']:
+        dir = os.path.join(version_dir, folder)
+        if not os.path.isdir(dir):
+            os.mkdir(dir)
+
+    model_dir = os.path.join(version_dir, 'outputs')
+    log_dir = os.path.join(version_dir, 'logs')
+
+    set_logger(os.path.join(model_dir, 'train.log'))
+    writer = SummaryWriter(log_dir)
+
+    logging.info("-----------------------------------------------------------------------------")
+    logging.info("---------------Spatiotemporal CRL of xBD Building Object Image Patches---------------")
+
+    #######################################################
+    # Log arguments
+    #######################################################
+    logging.info('experiment: {}'.format(args.experiment))
+    logging.info('version: {}'.format(args.version))
+    logging.info('data_path: {}'.format(args.data_path))
+    logging.info('csv_train: {}'.format(args.csv_train))
+    logging.info('pretrained_model: {}'.format(args.pretrained_model))
+    logging.info('backbone: {}'.format(args.backbone))
+    logging.info('lr: {}'.format(args.lr))
+    logging.info('wd: {}'.format(args.wd))
+    logging.info('n_epochs: {}'.format(args.n_epochs))
+    logging.info('train batch size: {}'.format(args.train_batch_size))
+    logging.info('print_freq: {}'.format(args.print_freq))
+
+    #######################################################
+    # downstream model for image classification
+    #######################################################
+    # load computing device, cpu or gpu
+    device = torch.device("cuda:0" if args.gpu and torch.cuda.is_available() else "cpu")
+    net = Model(h_dim = 512, backbone_net=args.backbone).to(device=device)
+    logging.info(device)
+    logging.info(net)
+
+    #######################################################
+    # Criterion, optimizer, learning rate scheduler
+    #######################################################
+    #criterion = torch.nn.L1Loss()
+    #criterion = torch.nn.MSELoss()
+    #criterion = torch.nn.BCELoss()
+    #weight = torch.tensor([0.03087066637337608, 0.2944726031734042, 0.3531639351033918, 0.3214927953498281], device=device)
+    #weight = torch.tensor([1.0, 1.0, 1.0, 1.0], device=device)
+    #criterion = torch.nn.CrossEntropyLoss(weight=weight)
+    criterion = barlow_twins_loss
+    optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, weight_decay=args.wd, momentum=0.9)
+    #optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd)
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 150], gamma=0.1)
+    logging.info(criterion)
+    logging.info(optimizer)
+    logging.info(scheduler)
+
+    #######################################################
+    # train + valid dataset
+    #######################################################
+    # mean & std
+
+    # different mean and std for pre and post images
+    #mean_pre = (0.38768055, 0.40568469, 0.32679225)
+    #std_pre = (0.16692868, 0.14560078, 0.15216715)
+    #mean_post = (0.39971367, 0.40851469, 0.32853808)
+    #std_post = (0.16498802, 0.14440385, 0.15470104)
+
+    # same mean and std for pre and post images
+    mean_pre = (0.39327543, 0.40631564, 0.32678495)
+    std_pre = (0.16512179, 0.14379614, 0.15171282)
+    mean_post = (0.39327543, 0.40631564, 0.32678495)
+    std_post = (0.16512179, 0.14379614, 0.15171282)
+    # train data
+    transform_trn = transforms.Compose([
+        dp.RandomFlip(p=0.5),
+        dp.RandomRotate(angle=40),
+        dp.RandomResizedCrop(size=88, scale=(0.8, 1.0)),
+        #dp.ColorJitter_BCSH(0.2, 0.2, 0.2, 0.1, p=0.5),
+        #dp.GaussianBlur(kernel_size=9, sigma_range=(0.1, 2.0), p=0.5),
+        dp.ToTensor(),
+        dp.Normalize_Std(mean_pre, std_pre, mean_post, std_post)
+        ])
+    trainset = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
+                                    csv_file=args.csv_train,
+                                    transform=transform_trn)
+    
+    # split to smaller datasets
+    # lengths = [len(trainset) // 30, len(trainset) - len(trainset) // 30]
+    # trainset, _ = random_split(trainset, lengths)
+
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.train_batch_size, shuffle=True, num_workers=4)
+    logging.info(trainset)
+
+    #######################################################
+    # resume from pre-trained model
+    #######################################################
+    min_loss = float('inf') # initialize valid loss to a large number
+    start_epoch = 0
+    if args.pretrained_model:
+        checkpoint = torch.load(args.pretrained_model, map_location=device)
+        start_epoch = checkpoint['epoch']
+        min_loss = checkpoint['min_loss']
+        net.load_state_dict(checkpoint['net_state_dict'])
+        logging.info("resumed checkpoint at epoch {} with min loss {:.4f}".format(start_epoch, min_loss))
+
+    #######################################################
+    # start training + validation
+    #######################################################
+    t0 = time.time()
+    for ep in range(args.n_epochs):
+        logging.info('Epoch [{}/{}]'.format(start_epoch+ep + 1, start_epoch+args.n_epochs))
+
+        # training
+        t1 = time.time()
+        loss_train = train(trainloader, net, criterion, optimizer, start_epoch+ep, writer, device, args.print_freq)
+        t2 = time.time()
+        logging.info('Train [Time: {:.2f} hours] [Loss: {:.4f}]'.format((t2 - t1) / 3600.0, loss_train))
+        writer.add_scalars('training/Loss', {"train": loss_train}, start_epoch+ep + 1)
+
+        logging.info('Time spent total at [{}/{}]: {:.2f}'.format(start_epoch + ep + 1, start_epoch + args.n_epochs, (t2 - t0) / 3600.0))
+
+        # save the best model
+        is_best = loss_train < min_loss
+        min_loss = min(loss_train, min_loss)
+        save_checkpoint({
+            'epoch': start_epoch + ep + 1,
+            'net_state_dict': net.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'min_loss': min_loss,
+        }, is_best, root_dir=model_dir, checkpoint_name='checkpoint_ep_{}'.format(start_epoch + ep + 1))
+
+        # reschedule learning rate
+        #scheduler.step(loss_train) # if valid loss plateau
+        scheduler.step() # for multiple step LR change
+        current_LR = optimizer.param_groups[0]['lr']
+        logging.info('Current learning rate: {:.4e}'.format(current_LR))
+        if current_LR < 1e-6:
+            logging.info('**********Learning rate too small, training stopped at epoch {}**********'.format(start_epoch + ep + 1))
+            break
+
+    logging.info('Training Done....')
+
+    logging.info('Validating...')
+
+    # Define strong augmentation
+    strong_augmentation = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(size=(32, 32), padding=4),  # Crop images from center
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.RandomRotation(15)
+    ])
+
+    # Evaluation mode
+    net.eval()
+
+    features = []
+    labels = []
+
+    # 1. Extract features
+    for i, batch in enumerate(trainloader):
+        bldg_pre = batch['bldg_pre'].to(device=device, dtype=torch.float32)
+        bldg_post = batch['bldg_post'].to(device=device, dtype=torch.float32)
+        bldg_label = batch['label'].to(device=device, dtype=torch.int64)
+
+        # Generate weak and strong augmentations
+        bldg_pre_strong = strong_augmentation(bldg_pre)
+        bldg_post_strong = strong_augmentation(bldg_post)
+
+        with torch.no_grad():
+        # Feed forward with strong augmentation
+            _, _, z_pre_strong, z_post_strong = net(bldg_pre_strong, bldg_post_strong)
+            features.append(net.pairs_similarity(z_pre_strong, z_post_strong).cpu().numpy())
+            labels.append(bldg_label.cpu().numpy())
+
+    features = np.concatenate(features).reshape(-1, 1)
+    labels = np.concatenate(labels)
+
+    # Create a DataFrame from features and labels
+    df = pd.DataFrame(features, columns=['feature'])
+    df['label'] = labels
+
+    # Separate majority and minority classes
+    df_majority = df[df.label==0]
+    df_minority1 = df[df.label==1]
+    df_minority2 = df[df.label==2]
+    df_minority3 = df[df.label==3]
+
+    # Get the number of samples in the largest class
+    n_samples = df_majority.shape[0]
+
+    # Upsample minority classes
+    df_minority_upsampled1 = resample(df_minority1, replace=True, n_samples=n_samples, random_state=42)
+    df_minority_upsampled2 = resample(df_minority2, replace=True, n_samples=n_samples, random_state=42)
+    df_minority_upsampled3 = resample(df_minority3, replace=True, n_samples=n_samples, random_state=42)
+
+    # Combine majority class with upsampled minority classes
+    df_upsampled = pd.concat([df_majority, df_minority_upsampled1, df_minority_upsampled2, df_minority_upsampled3])
+
+    # Now you can use df_upsampled to train your classifier
+    features = df_upsampled['feature'].values.reshape(-1, 1)
+    labels = df_upsampled['label'].values
+
+    # 2. Supervised Classifier
+    classifier = MLPClassifier(hidden_layer_sizes=(100, 100, 100),  # three layers of 100 nodes each
+                           activation='tanh',  # tanh activation function
+                           solver='sgd',  # stochastic gradient descent solver
+                           alpha=0.0001,  # regularization term
+                           learning_rate='adaptive',  # adaptive learning rate
+                           max_iter=1000,  # maximum number of iterations
+                           random_state=42)  # for reproducibility
+    classifier.fit(features, labels)
+
+    # 3. Make predictions
+    valset = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
+                                    csv_file=args.csv_valid,
+                                    transform=transform_trn)
+    # split to smaller datasets
+    # lengths = [len(valset) // 30, len(valset) - len(valset) // 30]
+    # valset, _ = random_split(valset, lengths)
+    validloader = torch.utils.data.DataLoader(valset, batch_size=args.train_batch_size, shuffle=True, num_workers=4)
+    logging.info(valset)
+
+    features = []
+    labels = []
+
+    for i, batch in enumerate(validloader):
+        bldg_pre = batch['bldg_pre'].to(device=device, dtype=torch.float32)
+        bldg_post = batch['bldg_post'].to(device=device, dtype=torch.float32)
+        bldg_label = batch['label'].to(device=device, dtype=torch.int64)
+
+        # Generate weak and strong augmentations
+        bldg_pre_strong = strong_augmentation(bldg_pre)
+        bldg_post_strong = strong_augmentation(bldg_post)
+
+        with torch.no_grad():
+        # Feed forward with strong augmentation
+            _, _, z_pre_strong, z_post_strong = net(bldg_pre_strong, bldg_post_strong)
+            features.append(net.pairs_similarity(z_pre_strong, z_post_strong).cpu().numpy())
+            labels.append(bldg_label.cpu().numpy())
+
+    features = np.concatenate(features).reshape(-1, 1)
+    labels = np.concatenate(labels)
+
+    # Make predictions
+    valid_preds = classifier.predict(features)
+
+    # Compute metrics
+    accuracy = accuracy_score(labels, valid_preds)
+    precision = precision_score(labels, valid_preds, average='macro')
+    recall = recall_score(labels, valid_preds, average='macro')
+    f1 = f1_score(labels, valid_preds, average='macro')
+    cm = confusion_matrix(labels, valid_preds)
+
+    logging.info(f'Accuracy: {accuracy}')
+    logging.info(f'Precision: {precision}')
+    logging.info(f'Recall: {recall}')
+    logging.info(f'F1 Score: {f1}')
+    logging.info(f'Confusion Matrix: {cm}')
+
+    logging.info('Validation Done....')
+
+
+def train(dataloader, net, criterion, optimizer, epoch, writer, device='cpu', print_freq=5):
+
+    logging.info('Training...')
+    net.train()
+
+    epoch_loss = AverageMeter()
+    n_batches = len(dataloader)
+    #pdb.set_trace()
+    
+    # Initialize teacher model
+    teacher_net = copy.deepcopy(net)
+    teacher_net.load_state_dict(net.state_dict())
+
+    for i, batch in enumerate(dataloader):
+
+        bldg_pre = batch['bldg_pre'].to(device=device, dtype=torch.float32)
+        bldg_post = batch['bldg_post'].to(device=device, dtype=torch.float32)
+        batch_size = bldg_post.shape[0]
+
+        # feed forward
+        _, _, z_pre, z_post = net(bldg_pre, bldg_post)
+        student_loss = net.NT_Xent_Loss_v3(z_pre, z_post)
+
+        # Feed forward with teacher model
+        with torch.no_grad():
+            _, _, teacher_z_pre, teacher_z_post = teacher_net(bldg_pre, bldg_post)
+
+        # Compute consistency loss
+        consistency_loss = net.NT_Xent_Loss_v3(teacher_z_pre, teacher_z_post)
+
+        # Combine losses
+        loss = student_loss + consistency_loss
+
+        # log loss
+        epoch_loss.update(loss.item(), batch_size)
+        writer.add_scalar('training/train_loss', loss.item(), epoch*n_batches+i)
+
+        if i < 10:
+            grid_pre = utils.make_grid(vis_ms(bldg_pre[:16], 0, 1, 2), nrow=4, normalize=True)
+            grid_post = utils.make_grid(vis_ms(bldg_post[:16], 0, 1, 2), nrow=4, normalize=True)
+            writer.add_image('training/train_bldgs_pre', grid_pre, epoch*n_batches+i)
+            writer.add_image('training/train_bldgs_post', grid_post, epoch*n_batches+i)
+
+        # back propagation
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Update teacher model
+        for student_params, teacher_params in zip(net.parameters(), teacher_net.parameters()):
+            teacher_params.data.mul_(0.99).add_(0.01, student_params.data)
+
+        if i % (n_batches // print_freq + 1) == 0:
+            logging.info('[{}][{}/{}], loss={:.4f}'.format(epoch+1, i, n_batches, epoch_loss.avg))
+
+    return epoch_loss.avg
+
+
+if __name__ == '__main__':
+    args = parser.parse_args()
+    main(args)
